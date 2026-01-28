@@ -1,0 +1,56 @@
+# KiCad backup / autosave
+*.bak
+*.bck
+*-backups/
+*.tmp
+*.tmp.*
+*.old
+*.save
+*.autosave
+*#auto_saved_*
+*_autosave*
+*.lck
+# KiCad cache & info files
+*.kicad_prl
+fp-info-cache
+sym-lib-table-bak
+fp-lib-table-bak
+
+# Netlist, BOM, CAD and export outputs
+*.xml
+*.net
+*.dsn
+*.json
+*.pos
+*.rpt
+*.csv
+*.bom
+*.gbr
+*.gtl
+*.gbl
+*.gts
+*.gbs
+*.gto
+*.gbo
+*.drl
+*.zip
+
+# 3D Rendering / STEP / VRML exports
+*.step
+*.stp
+*.wrl
+
+# Simulation files
+*.cir
+*.sp
+*.raw
+*.log
+*.plt
+
+# Metadata from OS
+.DS_Store
+Thumbs.db
+
+# Python cache (KiCad plugins/scripts)
+__pycache__/
+*.pyc
