@@ -1,4 +1,6 @@
+# =========================
 # KiCad backup / autosave
+# =========================
 *.bak
 *.bck
 *-backups/
@@ -10,6 +12,7 @@
 *#auto_saved_*
 *_autosave*
 *.lck
+
 # KiCad cache & info files
 *.kicad_prl
 fp-info-cache
@@ -47,26 +50,56 @@ fp-lib-table-bak
 *.log
 *.plt
 
-# Metadata from OS
+# =========================
+# OS metadata
+# =========================
 .DS_Store
 Thumbs.db
 
-# Python cache (KiCad plugins/scripts)
+# =========================
+# Python cache (scripts/plugins)
+# =========================
 __pycache__/
 *.pyc
 
-# ESP-IDF build system
-build/
-sdkconfig
-sdkconfig.old
+# =========================
+# STM32CubeIDE / Eclipse
+# =========================
+# Eclipse metadata
+.metadata/
+
+
+# CubeIDE build output directories
+**/Debug/
+**/Release/
+**/RelWithDebInfo/
+**/MinSizeRel/
+
+# Common STM32/Cube toolchain artifacts
 *.o
 *.d
 *.a
+*.su
+*.obj
 *.elf
+*.axf
 *.bin
+*.hex
 *.map
+*.list
+*.lst
 
-# ESP-IDF dependencies
+# Optional generated linker/listing artifacts
+*.srec
+*.i
+*.ii
+
+# =========================
+# Legacy ESP-IDF rules (keep if still relevant)
+# =========================
+build/
+sdkconfig
+sdkconfig.old
 dependencies.lock
 managed_components/
 .cache
