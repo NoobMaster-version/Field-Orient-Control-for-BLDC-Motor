@@ -90,12 +90,12 @@
 #define DEAD_TIME_COUNTS          20U       /* match sBDT.DeadTime below       */
 
 /* Duty levels (0–100 %) — TODO: tune for your motor & supply voltage --------*/
-#define MIN_DUTY_PERCENT          18U        /* absolute floor (avoid shoot-through) */
+#define MIN_DUTY_PERCENT          15U        /* absolute floor (avoid shoot-through) */
 #define START_DUTY_PERCENT        10U       /* duty used during alignment + start   */
-#define MAX_DUTY_PERCENT          45U       /* steady-state ceiling                 */
+#define MAX_DUTY_PERCENT          25U       /* steady-state ceiling                 */
 
 /* Alignment -----------------------------------------------------------------*/
-#define ALIGN_TIME_MS             700U      /* TODO: increase if rotor slips       */
+#define ALIGN_TIME_MS             1500U      /* TODO: increase if rotor slips    2000   */
 
 /* Commutation ramp ----------------------------------------------------------
  * A2212 2200KV on 2S (7.4V) idles at ~1000 RPM unloaded and spins up fast.
@@ -113,13 +113,13 @@
  *     START_DUTY_PERCENT (but watch current).
  *   - If it stalls before reaching MIN: decrease COMMUTATION_RAMP_STEP.
  * --------------------------------------------------------------------------*/
-#define START_COMMUTATION_DELAY_MS  25U      /* ~125 Hz elec = ~18 Hz mech (2p=7) */
-#define MIN_COMMUTATION_DELAY_MS    6U      /* ~500 Hz elec = ~71 Hz mech        */
-#define COMMUTATION_RAMP_STEP_REVS  12U      /* decrease delay every N steps      */
+#define START_COMMUTATION_DELAY_MS  35U      /* ~125 Hz elec = ~18 Hz mech (2p=7) 80*/
+#define MIN_COMMUTATION_DELAY_MS    10U      /* ~500 Hz elec = ~71 Hz mech       12 */
+#define COMMUTATION_RAMP_STEP_REVS  3U      /* decrease delay every N steps    18  */
 #define COMMUTATION_RAMP_DEC_MS     1U      /* decrease by this many ms each time */
 
 /* Fault retry ---------------------------------------------------------------*/
-#define FAULT_MAX_RETRIES         1U        /* do NOT increase past 1              */
+#define FAULT_MAX_RETRIES         0U        /* do NOT increase past 1              */
 
 /* ===========================================================================
  * Derived constants (do not edit)
@@ -366,14 +366,14 @@ void commutation_tick_handler(void)
             {
                 commutation_delay_ms -= COMMUTATION_RAMP_DEC_MS;
 
-                /* Also ramp duty up toward MAX so torque scales with speed */
-                uint32_t max_ccr = DUTY_TO_CCR(MAX_DUTY_PERCENT);
-                if (duty_ccr < max_ccr)
-                {
-                    /* Increase duty by ~1% of PWM_PERIOD per ramp tick     */
-                    duty_ccr += (PWM_PERIOD / 100U);
-                    if (duty_ccr > max_ccr) duty_ccr = max_ccr;
-                }
+//                /* Also ramp duty up toward MAX so torque scales with speed */
+//                uint32_t max_ccr = DUTY_TO_CCR(MAX_DUTY_PERCENT);
+//                if (duty_ccr < max_ccr)
+//                {
+//                    /* Increase duty by ~1% of PWM_PERIOD per ramp tick     */
+//                    duty_ccr += (PWM_PERIOD / 100U);
+//                    if (duty_ccr > max_ccr) duty_ccr = max_ccr;
+//                }
             }
             else
             {
