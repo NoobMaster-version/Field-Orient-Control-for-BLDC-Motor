@@ -1,0 +1,46 @@
+menu "Field Orient Bring-Up"
+
+config APP_STAGE_DRV_GPIO
+	bool "Enable DRV8311 GPIO bring-up"
+	default y
+
+config APP_STAGE_I2C_AS5600
+	bool "Enable AS5600 I2C polling"
+	default n
+
+config APP_STAGE_PWM_TEST
+	bool "Enable TIM1 PWM test"
+	default n
+
+config APP_STAGE_ADC_TEST
+	bool "Enable ADC sampling test"
+	default n
+
+config APP_HEARTBEAT_PERIOD_MS
+	int "Heartbeat print period in milliseconds"
+	default 500
+	range 100 5000
+
+config APP_AS5600_POLL_PERIOD_MS
+	int "AS5600 poll period in milliseconds"
+	default 200
+	range 20 5000
+
+config APP_ADC_POLL_PERIOD_MS
+	int "ADC poll period in milliseconds"
+	default 500
+	range 20 5000
+
+config APP_PWM_TEST_PERIOD_USEC
+	int "PWM test period in microseconds"
+	default 50
+	range 5 1000000
+
+config APP_PWM_TEST_DUTY_PERCENT
+	int "PWM test duty percent"
+	default 50
+	range 0 100
+
+endmenu
+
+source "Kconfig.zephyr"

@@ -1,0 +1,17 @@
+identifier: field_orient_g431
+name: Field Orient STM32G431 Custom Board
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+  - gnuarmemb
+ram: 32
+flash: 128
+supported:
+  - adc
+  - gpio
+  - i2c
+  - pinctrl
+  - pwm
+  - uart
+vendor: others

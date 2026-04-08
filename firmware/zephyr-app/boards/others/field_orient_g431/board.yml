@@ -1,0 +1,6 @@
+board:
+  name: field_orient_g431
+  full_name: Field Orient STM32G431 Custom Board
+  vendor: others
+  socs:
+    - name: stm32g431xx

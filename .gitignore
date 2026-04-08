@@ -81,7 +81,7 @@ __pycache__/
 *.a
 *.su
 *.obj
-*.elf
+# *.elf
 *.axf
 *.bin
 *.hex

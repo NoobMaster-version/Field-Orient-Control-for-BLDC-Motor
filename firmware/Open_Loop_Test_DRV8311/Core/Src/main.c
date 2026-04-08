@@ -1,739 +1,651 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Open-loop 6-step BLDC startup — DRV8311H 3× PWM mode
-  *                   STM32G431CBT6 @ 170 MHz
-  *
-  * ============================================================
-  *  WHAT WAS WRONG IN failed_test.c — and what was fixed here
-  * ============================================================
-  *
-  * BUG 1 — Sinusoidal / SVM drive with no angle feedback
-  *   failed_test.c computed sine waves at an arbitrary speed and wrote the
-  *   result directly to the three PWM channels. Without a rotor-position
-  *   sensor or BEMF estimator the stator field rotates at whatever speed the
-  *   MCU chooses; the rotor simply cannot follow from rest and only buzzes.
-  *   FIX: replaced with explicit alignment + open-loop 6-step commutation.
-  *   The rotor locks to a known electrical position, then the firmware steps
-  *   through the six commutation states with a decreasing inter-step delay so
-  *   the rotor can accelerate gradually before reaching steady speed.
-  *
-  * BUG 2 — INLx held permanently HIGH
-  *   failed_test.c set PB13/14/15 HIGH and never touched them again. In 3×PWM
-  *   mode each commutation step requires one phase to be Hi-Z (floating). Hi-Z
-  *   is achieved by setting INLx = 0 *and* INHx = 0 for that phase. With INLx
-  *   always HIGH the low-side of the floating phase switches every PWM cycle,
-  *   creating spurious currents and preventing clean 6-step operation.
-  *   FIX: apply_commutation_step() drives INLx GPIOs per-step, asserting only
-  *   the two active phases and clearing the floating phase.
-  *
-  * BUG 3 — ISR doing heavy floating-point math at 40 kHz
-  *   Three sinf() calls + SVM + dead-time compensation inside a 40 kHz ISR
-  *   is CPU-intensive and unnecessary for 6-step. The corrected ISR is a
-  *   simple tick counter; the main loop calls commutation_tick_handler() at a
-  *   safe poll rate and the actual commutation table lookup involves no FP.
-  *
-  * BUG 4 — No alignment step
-  *   failed_test.c started the sine ramp immediately. With no knowledge of
-  *   initial rotor position the first electrical cycle could push the rotor in
-  *   the wrong direction.
-  *   FIX: motor_align() holds step 0 at a low duty for ALIGN_TIME_MS before
-  *   any commutation begins.
-  *
-  * PRESERVED from failed_test.c (these were correct):
-  *   - RepetitionCounter = 0   (UEV every overflow)
-  *   - NVIC explicitly enabled for TIM1_UP_TIM16_IRQn
-  *   - TIM1_UP_TIM16_IRQHandler defined here (remove from stm32g4xx_it.c!)
-  *   - HAL_TIM_MOE_ENABLE moved after HAL_TIM_Base_Start_IT
-  *   - UIF cleared before enabling IT
-  *   - MOE verified with hard check after setting
-  *
-  * ============================================================
-  *  DRV8311H 3× PWM semantics (one line)
-  *  INLx = 0 → Hi-Z  |  INLx=1 + INHx=1 → H  |  INLx=1 + INHx=0 → L
-  * ============================================================
-  *
-  * SAFETY NOTES (read before powering up):
-  *   - First test with NO motor attached and a bench PSU with current limit.
-  *   - Verify VM > 2.7 V, AVDD > 3 V, and nFAULT HIGH before enabling PWM.
-  *   - Keep START_DUTY_PERCENT low (≤ 15 %) for initial tests.
-  *   - If nFAULT remains LOW after one reset attempt the code halts; do not
-  *     short-circuit this check.
-  *
-  * HARDWARE:
-  *   MCU  : STM32G431CBT6
-  *   PA8  → TIM1_CH1 → DRV8311 INHA
-  *   PA9  → TIM1_CH2 → DRV8311 INHB
-  *   PA10 → TIM1_CH3 → DRV8311 INHC
-  *   PB13 → INLA  (GPIO output)
-  *   PB14 → INLB  (GPIO output)
-  *   PB15 → INLC  (GPIO output)
-  *   PC13 → nSLEEP (GPIO output, HIGH = awake)
-  *   PC14 → nFAULT (GPIO input,  LOW = fault)
-  *   SOA/SOB/SOC → ADC channels (see TODO below)
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-
 #include "main.h"
-#include <stdio.h>
+#include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 
-/* ===========================================================================
- * !! TUNING PARAMETERS — review every value before first power-on !!
- * =========================================================================*/
-
-/* PWM carrier ---------------------------------------------------------------*/
-#define PWM_FREQ_HZ               20000U    /* switching frequency             */
-#define PWM_PERIOD                4250U     /* ARR: 170 MHz / (2 × 4250) = 20 kHz */
-#define DEAD_TIME_COUNTS          20U       /* match sBDT.DeadTime below       */
-
-/* Duty levels (0–100 %) — TODO: tune for your motor & supply voltage --------*/
-#define MIN_DUTY_PERCENT          15U        /* absolute floor (avoid shoot-through) */
-#define START_DUTY_PERCENT        10U       /* duty used during alignment + start   */
-#define MAX_DUTY_PERCENT          25U       /* steady-state ceiling                 */
-
-/* Alignment -----------------------------------------------------------------*/
-#define ALIGN_TIME_MS             1500U      /* TODO: increase if rotor slips    2000   */
-
-/* Commutation ramp ----------------------------------------------------------
- * A2212 2200KV on 2S (7.4V) idles at ~1000 RPM unloaded and spins up fast.
- * With 7 pole pairs: 1000 RPM mech = 7000 RPM elec = 117 Hz elec.
- * That is ~8.5 ms per electrical revolution = 1.4 ms per step at idle.
- *
- * Start slow enough for the rotor to lock on the first few steps, then
- * ramp quickly. COMMUTATION_RAMP_STEP reduces by 2 ms per revolution
- * (every 6 steps) which is aggressive enough to accelerate smoothly.
- *
- * Tuning guide:
- *   - If the motor stalls during ramp: increase START_COMMUTATION_DELAY_MS
- *     or decrease COMMUTATION_RAMP_STEP.
- *   - If it vibrates at the start: increase ALIGN_TIME_MS or
- *     START_DUTY_PERCENT (but watch current).
- *   - If it stalls before reaching MIN: decrease COMMUTATION_RAMP_STEP.
- * --------------------------------------------------------------------------*/
-#define START_COMMUTATION_DELAY_MS  35U      /* ~125 Hz elec = ~18 Hz mech (2p=7) 80*/
-#define MIN_COMMUTATION_DELAY_MS    10U      /* ~500 Hz elec = ~71 Hz mech       12 */
-#define COMMUTATION_RAMP_STEP_REVS  3U      /* decrease delay every N steps    18  */
-#define COMMUTATION_RAMP_DEC_MS     1U      /* decrease by this many ms each time */
-
-/* Fault retry ---------------------------------------------------------------*/
-#define FAULT_MAX_RETRIES         0U        /* do NOT increase past 1              */
-
-/* ===========================================================================
- * Derived constants (do not edit)
- * =========================================================================*/
-#define DUTY_TO_CCR(pct)  ((uint32_t)((pct) * PWM_PERIOD / 100U))
-
-/* ===========================================================================
- * TODO: ADC channel assignments for current sense (SOA/SOB/SOC)
- *   #define ADC_CHANNEL_SOA   ADC_CHANNEL_1  // TODO: set correct channel
- *   #define ADC_CHANNEL_SOB   ADC_CHANNEL_2  // TODO: set correct channel
- *   #define ADC_CHANNEL_SOC   ADC_CHANNEL_3  // TODO: set correct channel
- *
- * TODO: CSA gain / ADC scaling
- *   #define CSA_GAIN          40.0f          // DRV8311 GAIN pin = 3V3 → ×40
- *   #define SHUNT_OHMS        0.01f          // TODO: measure actual shunt
- *   // I_phase (A) = (ADC_raw / 4095.0f * 3.3f) / (CSA_GAIN * SHUNT_OHMS)
- * =========================================================================*/
-
-/* ===========================================================================
- * HAL peripheral handles (CubeIDE generates these)
- * =========================================================================*/
 I2C_HandleTypeDef  hi2c1;
 TIM_HandleTypeDef  htim1;
 UART_HandleTypeDef huart3;
 
-/* ===========================================================================
- * Motor state
- * =========================================================================*/
 typedef enum {
     MOTOR_IDLE = 0,
     MOTOR_ALIGNING,
-    MOTOR_RAMPING,
     MOTOR_RUNNING,
     MOTOR_FAULT
 } MotorState_t;
 
-static volatile MotorState_t motor_state          = MOTOR_IDLE;
-static volatile uint8_t      comm_step            = 0;        /* 0–5           */
-static volatile uint32_t     commutation_delay_ms = START_COMMUTATION_DELAY_MS;
-static volatile uint32_t     last_comm_tick       = 0;
-static volatile uint32_t     isr_tick             = 0;        /* for debug     */
-static volatile uint8_t      fault_retry_count    = 0;
-static volatile uint32_t     step_count           = 0;        /* total steps since ramp start */
+#define AS5600_ADDR               (0x36U << 1)
+#define AS5600_RAW_ANGLE_REG      0x0CU
+#define AS5600_STATUS_REG         0x0BU
+#define AS5600_COUNTS_PER_REV     4096.0f
 
-/* duty_ccr — module-level so commutation_tick_handler() can ramp it.
- * apply_commutation_step() reads this directly.
- * Initialised in main() before motor_align() is called.                     */
-static volatile uint32_t     duty_ccr = 0;
+#define MOTOR_POLE_PAIRS          6.0f
+#define ENCODER_DIRECTION         1.0f
+#define ROTATION_DIRECTION        1.0f
 
-/* ===========================================================================
- * Private function prototypes
- * =========================================================================*/
+#define PWM_FREQ_HZ               20000U
+#define PWM_PERIOD                4250U
+#define PWM_HALF_PERIOD           (PWM_PERIOD / 2U)
+#define DEAD_TIME_COUNTS          20U
+
+#define CONTROL_PERIOD_US         1000U
+#define DEBUG_PERIOD_MS           250U
+
+#define ALIGN_SECTOR_CENTER_RAD    (5.0f * PI_F / 3.0f)
+#define ALIGN_DUTY_PERCENT        14U
+#define ALIGN_RAMP_MS             250U
+#define ALIGN_HOLD_MS             300U
+#define ALIGN_SAMPLE_COUNT        24U
+#define SINE_HANDOFF_MS           300U
+#define RUN_SETTLE_MS             900U
+
+#define RUN_START_MODULATION      0.07f
+#define RUN_TARGET_MODULATION     0.18f
+#define MODULATION_RAMP_MS        3200U
+#define TARGET_MECH_SPEED_RPS     0.30f
+#define SPEED_RAMP_MS             6500U
+#define POSITION_KP               0.95f
+#define FEEDFORWARD_LEAD_RAD      0.20f
+#define MAX_TORQUE_LEAD_RAD       0.70f
+
+#define I2C_TIMEOUT_MS            10U
+#define STARTUP_IDLE_MS           100U
+
+#define TWO_PI_F                  6.28318530718f
+#define PI_F                      3.14159265359f
+#define TWO_PI_BY_THREE_F         2.09439510239f
+#define SQRT3_BY_2_F             0.86602540378f
+
+typedef struct {
+    uint16_t raw;
+    float mech_angle_rad;
+    float mech_angle_deg;
+    float mech_unwrapped_rad;
+    uint8_t magnet_ok;
+    uint8_t valid;
+} EncoderSample_t;
+
+static volatile MotorState_t motor_state = MOTOR_IDLE;
+static volatile uint16_t encoder_raw_dbg = 0U;
+static volatile float encoder_mech_deg_dbg = 0.0f;
+static volatile float encoder_mech_unwrapped_dbg = 0.0f;
+static volatile float rotor_elec_deg_dbg = 0.0f;
+static volatile float stator_elec_deg_dbg = 0.0f;
+static volatile float target_mech_deg_dbg = 0.0f;
+static volatile float lead_deg_dbg = 0.0f;
+static volatile float speed_rpm_dbg = 0.0f;
+static volatile float modulation_dbg = 0.0f;
+static volatile uint8_t magnet_ok_dbg = 0U;
+static volatile uint8_t i2c_fault_dbg = 0U;
+
+static float zero_electrical_offset_rad = 0.0f;
+static float mech_angle_prev_rad = 0.0f;
+static float mech_angle_unwrapped_rad = 0.0f;
+static float target_mech_angle_rad = 0.0f;
+static uint8_t encoder_tracking_ready = 0U;
+
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART3_UART_Init(void);
 
-void motor_align(void);
-void apply_commutation_step(uint8_t step);
-void commutation_tick_handler(void);
-void emergency_stop(void);
-static void handle_fault(void);
+static uint8_t as5600_read_raw(uint16_t *raw_angle);
+static uint8_t as5600_magnet_detected(void);
+static uint8_t encoder_sample(EncoderSample_t *sample);
+static void encoder_reset_tracking(float mech_angle_rad);
+static void outputs_hiz(void);
+static void outputs_enable_sine_mode(void);
+static void apply_sine_pwm(float stator_angle_rad, float modulation);
+static void apply_two_phase_align(uint32_t duty_ccr);
+static uint8_t driver_wake_and_check_fault(void);
+static void driver_fault_stop(const char *reason);
+static void motor_align_and_capture_zero(void);
+static uint32_t micros32(void);
+static void dwt_init(void);
+static float clampf(float x, float lo, float hi);
+static float normalize_angle(float angle);
+static float wrap_pm_pi(float angle);
+static float electrical_angle_from_mech(float mech_angle_rad);
+static float radians_to_degrees(float radians);
+static float lerp_angle(float a, float b, float t);
 
-/* ===========================================================================
- * __io_putchar — routes printf → UART3
- * =========================================================================*/
 int __io_putchar(int ch)
 {
-    HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1U, HAL_MAX_DELAY);
     return ch;
 }
 
-/* ===========================================================================
- * 6-Step commutation table
- *
- * Each row encodes one of the six electrical states for a standard
- * trapezoidal (6-step) BLDC drive.
- *
- * Columns: { INHA_duty, INHB_duty, INHC_duty, INLA, INLB, INLC }
- *
- * Convention (DRV8311 3× PWM):
- *   Active-HIGH phase  : INHx = PWM duty,    INLx = 1  → switches H
- *   Active-LOW  phase  : INHx = 0,           INLx = 1  → pulls L
- *   Floating    phase  : INHx = 0,           INLx = 0  → Hi-Z
- *
- * Winding current direction per step (classic trapezoidal, CCW convention):
- *   Step 0: A→B  (A high, B low,  C float)
- *   Step 1: A→C  (A high, B float,C low )
- *   Step 2: B→C  (A float,B high, C low )
- *   Step 3: B→A  (A low,  B high, C float)
- *   Step 4: C→A  (A low,  B float,C high)
- *   Step 5: C→B  (A float,B low,  C high)
- *
- * TODO: if motor spins in wrong direction swap any two phase wires or
- *       reverse the step sequence (use 5,4,3,2,1,0 ordering).
- * =========================================================================*/
-typedef struct {
-    uint8_t inh_pwm_a;   /* 1 = PWM, 0 = off */
-    uint8_t inh_pwm_b;
-    uint8_t inh_pwm_c;
-    uint8_t inl_a;       /* GPIO level for INLA */
-    uint8_t inl_b;
-    uint8_t inl_c;
-} CommStep_t;
-
-static const CommStep_t COMM_TABLE[6] = {
-    /* step 0: A-high, B-low,   C-float */  { 1, 0, 0,  1, 1, 0 },
-    /* step 1: A-high, B-float, C-low   */  { 1, 0, 0,  1, 0, 1 },
-    /* step 2: B-high, A-float, C-low   */  { 0, 1, 0,  0, 1, 1 },
-    /* step 3: B-high, A-low,   C-float */  { 0, 1, 0,  1, 1, 0 },
-    /* step 4: C-high, A-low,   B-float */  { 0, 0, 1,  1, 0, 1 },
-    /* step 5: C-high, B-low,   A-float */  { 0, 0, 1,  0, 1, 1 },
-};
-
-/* ===========================================================================
- * emergency_stop
- *
- * De-energise all phases immediately:
- *   - Zero all PWM compare values  (INHx → 0)
- *   - Clear all INLx GPIOs          (phases → Hi-Z)
- * Motor will coast to a stop.
- * =========================================================================*/
-void emergency_stop(void)
+static float clampf(float x, float lo, float hi)
 {
-    /* Zero PWM output on all channels */
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+    if (x < lo) {
+        return lo;
+    }
+    if (x > hi) {
+        return hi;
+    }
+    return x;
+}
 
-    /* Drive INLx LOW → all phases Hi-Z */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+static float normalize_angle(float angle)
+{
+    while (angle >= TWO_PI_F) {
+        angle -= TWO_PI_F;
+    }
+    while (angle < 0.0f) {
+        angle += TWO_PI_F;
+    }
+    return angle;
+}
+
+static float wrap_pm_pi(float angle)
+{
+    while (angle > PI_F) {
+        angle -= TWO_PI_F;
+    }
+    while (angle < -PI_F) {
+        angle += TWO_PI_F;
+    }
+    return angle;
+}
+
+static float radians_to_degrees(float radians)
+{
+    return radians * (180.0f / PI_F);
+}
+
+static float lerp_angle(float a, float b, float t)
+{
+    return normalize_angle(a + wrap_pm_pi(b - a) * clampf(t, 0.0f, 1.0f));
+}
+
+static void dwt_init(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static uint32_t micros32(void)
+{
+    return DWT->CYCCNT / (SystemCoreClock / 1000000U);
+}
+
+static uint8_t as5600_read_raw(uint16_t *raw_angle)
+{
+    uint8_t rx[2] = {0U, 0U};
+
+    if (HAL_I2C_Mem_Read(&hi2c1,
+                         AS5600_ADDR,
+                         AS5600_RAW_ANGLE_REG,
+                         I2C_MEMADD_SIZE_8BIT,
+                         rx,
+                         2U,
+                         I2C_TIMEOUT_MS) != HAL_OK) {
+        return 0U;
+    }
+
+    *raw_angle = (uint16_t)((((uint16_t)rx[0] << 8) | (uint16_t)rx[1]) & 0x0FFFU);
+    return 1U;
+}
+
+static uint8_t as5600_magnet_detected(void)
+{
+    uint8_t status = 0U;
+
+    if (HAL_I2C_Mem_Read(&hi2c1,
+                         AS5600_ADDR,
+                         AS5600_STATUS_REG,
+                         I2C_MEMADD_SIZE_8BIT,
+                         &status,
+                         1U,
+                         I2C_TIMEOUT_MS) != HAL_OK) {
+        return 0U;
+    }
+
+    return (status & (1U << 5)) ? 1U : 0U;
+}
+
+static uint8_t encoder_sample(EncoderSample_t *sample)
+{
+    uint16_t raw = 0U;
+    float mech_angle_rad;
+
+    if (!as5600_read_raw(&raw)) {
+        sample->valid = 0U;
+        return 0U;
+    }
+
+    mech_angle_rad = ((float)raw * TWO_PI_F) / AS5600_COUNTS_PER_REV;
+
+    sample->raw = raw;
+    sample->mech_angle_rad = mech_angle_rad;
+    sample->mech_angle_deg = radians_to_degrees(mech_angle_rad);
+    sample->magnet_ok = as5600_magnet_detected();
+    sample->valid = 1U;
+
+    if (!encoder_tracking_ready) {
+        encoder_reset_tracking(mech_angle_rad);
+    } else {
+        float delta = wrap_pm_pi(mech_angle_rad - mech_angle_prev_rad);
+        mech_angle_unwrapped_rad += delta;
+        mech_angle_prev_rad = mech_angle_rad;
+    }
+
+    sample->mech_unwrapped_rad = mech_angle_unwrapped_rad;
+    return 1U;
+}
+
+static void encoder_reset_tracking(float mech_angle_rad)
+{
+    mech_angle_prev_rad = mech_angle_rad;
+    mech_angle_unwrapped_rad = mech_angle_rad;
+    encoder_tracking_ready = 1U;
+}
+
+static void outputs_hiz(void)
+{
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0U);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0U);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0U);
+
+    HAL_GPIO_WritePin(GPIOB,
+                      GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+                      GPIO_PIN_RESET);
+}
+
+static void outputs_enable_sine_mode(void)
+{
+    HAL_GPIO_WritePin(GPIOB,
+                      GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+                      GPIO_PIN_SET);
+}
+
+static void apply_two_phase_align(uint32_t duty_ccr)
+{
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty_ccr);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0U);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0U);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
-
-    motor_state = MOTOR_FAULT;
-    printf("!!! EMERGENCY STOP — all phases Hi-Z\r\n");
 }
 
-/* ===========================================================================
- * apply_commutation_step
- *
- * Writes a single 6-step commutation state to the timer and GPIO registers.
- * The duty cycle for the active-high phase is read from the current
- * duty_ccr variable (set during align/ramp/run).
- *
- * Parameters:
- *   step  — 0–5, index into COMM_TABLE
- * =========================================================================*/
-void apply_commutation_step(uint8_t step)
+static void apply_sine_pwm(float stator_angle_rad, float modulation)
 {
-    if (step > 5) return;
+    float angle = normalize_angle(stator_angle_rad);
+    float uq = clampf(modulation, 0.0f, 0.95f) * 0.5f;
+    float sa = sinf(angle);
+    float ca = cosf(angle);
+    float ualpha = -sa * uq;
+    float ubeta =  ca * uq;
+    float ua = ualpha + 0.5f;
+    float ub = (-0.5f * ualpha + SQRT3_BY_2_F * ubeta) + 0.5f;
+    float uc = (-0.5f * ualpha - SQRT3_BY_2_F * ubeta) + 0.5f;
+    uint32_t ccr_a = (uint32_t)clampf(ua * (float)PWM_PERIOD, 1.0f, (float)(PWM_PERIOD - 1U));
+    uint32_t ccr_b = (uint32_t)clampf(ub * (float)PWM_PERIOD, 1.0f, (float)(PWM_PERIOD - 1U));
+    uint32_t ccr_c = (uint32_t)clampf(uc * (float)PWM_PERIOD, 1.0f, (float)(PWM_PERIOD - 1U));
 
-    const CommStep_t *s = &COMM_TABLE[step];
-
-    /* duty_ccr is a module-level variable set by main() and updated by
-     * commutation_tick_handler() during the ramp. Do NOT use a static
-     * local here — that was the bug that locked duty at START_DUTY_PERCENT
-     * forever regardless of the ramp progress.                             */
-    uint32_t d = duty_ccr;
-
-    /* --- Write PWM compare registers --------------------------------------- */
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, s->inh_pwm_a ? d : 0U);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, s->inh_pwm_b ? d : 0U);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, s->inh_pwm_c ? d : 0U);
-
-    /* --- Write INLx GPIO pins ---------------------------------------------- */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13,
-                      s->inl_a ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14,
-                      s->inl_b ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15,
-                      s->inl_c ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr_a);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr_b);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr_c);
 }
 
-/* ===========================================================================
- * motor_align
- *
- * Locks the rotor to a known electrical position (step 0) by holding the
- * phase energised at START_DUTY_PERCENT for ALIGN_TIME_MS milliseconds.
- *
- * After this call the rotor sits near the step-0 stator axis. Commutation
- * can then begin from step 0 with a predictable initial torque direction.
- *
- * TODO: increase ALIGN_TIME_MS if the rotor does not settle reliably.
- *       Reduce START_DUTY_PERCENT if the motor jumps/vibrates too hard.
- * =========================================================================*/
-void motor_align(void)
+static uint8_t driver_wake_and_check_fault(void)
 {
-    motor_state = MOTOR_ALIGNING;
-    printf("ALIGN: holding step 0 for %u ms at %u%% duty\r\n",
-           ALIGN_TIME_MS, START_DUTY_PERCENT);
-
-    apply_commutation_step(0);
-    comm_step = 0;
-
-    HAL_Delay(ALIGN_TIME_MS);
-
-    printf("ALIGN: complete\r\n");
-}
-
-/* ===========================================================================
- * commutation_tick_handler
- *
- * Call this from the main loop (or a lower-priority timer ISR) to advance
- * the commutation state machine. It uses HAL_GetTick() to implement the
- * inter-step delay without blocking.
- *
- * Behaviour by motor_state:
- *   MOTOR_RAMPING  — advance step, decrease commutation_delay_ms by
- *                    COMMUTATION_RAMP_STEP until MIN_COMMUTATION_DELAY_MS.
- *   MOTOR_RUNNING  — advance step at MIN_COMMUTATION_DELAY_MS (steady).
- *   Other states   — no-op.
- * =========================================================================*/
-void commutation_tick_handler(void)
-{
-    if (motor_state != MOTOR_RAMPING && motor_state != MOTOR_RUNNING)
-        return;
-
-    uint32_t now = HAL_GetTick();
-    if ((now - last_comm_tick) < commutation_delay_ms)
-        return;
-
-    last_comm_tick = now;
-
-    /* Advance commutation step (0–5, wrap) */
-    comm_step = (comm_step + 1U) % 6U;
-    step_count++;
-    apply_commutation_step(comm_step);
-
-    /* Debug print once per electrical revolution (every 6 steps) */
-    if (comm_step == 0)
-        printf("COMM: revolution | delay=%lums | duty_ccr=%lu\r\n",
-               commutation_delay_ms, duty_ccr);
-
-    /* Ramp: every COMMUTATION_RAMP_STEP_REVS steps, reduce the inter-step
-     * delay AND increase duty slightly to maintain torque at higher speed.  */
-    if (motor_state == MOTOR_RAMPING)
-    {
-        if ((step_count % COMMUTATION_RAMP_STEP_REVS) == 0)
-        {
-            /* Reduce commutation delay */
-            if (commutation_delay_ms > MIN_COMMUTATION_DELAY_MS + COMMUTATION_RAMP_DEC_MS)
-            {
-                commutation_delay_ms -= COMMUTATION_RAMP_DEC_MS;
-
-//                /* Also ramp duty up toward MAX so torque scales with speed */
-//                uint32_t max_ccr = DUTY_TO_CCR(MAX_DUTY_PERCENT);
-//                if (duty_ccr < max_ccr)
-//                {
-//                    /* Increase duty by ~1% of PWM_PERIOD per ramp tick     */
-//                    duty_ccr += (PWM_PERIOD / 100U);
-//                    if (duty_ccr > max_ccr) duty_ccr = max_ccr;
-//                }
-            }
-            else
-            {
-                commutation_delay_ms = MIN_COMMUTATION_DELAY_MS;
-                duty_ccr             = DUTY_TO_CCR(MAX_DUTY_PERCENT);
-                motor_state          = MOTOR_RUNNING;
-                printf("COMM: ramp complete — steady @ %lu ms/step, duty_ccr=%lu\r\n",
-                       commutation_delay_ms, duty_ccr);
-            }
-        }
-    }
-}
-
-/* ===========================================================================
- * handle_fault
- *
- * Called from the main loop when nFAULT (PC14) is detected LOW.
- * Attempts one reset cycle by briefly pulling nSLEEP low, then re-checks.
- * Halts if the fault persists after FAULT_MAX_RETRIES attempts.
- * =========================================================================*/
-static void handle_fault(void)
-{
-    emergency_stop();
-
-    if (fault_retry_count >= FAULT_MAX_RETRIES)
-    {
-        printf("FAULT: retry limit reached — halting. Check wiring / VM.\r\n");
-        Error_Handler();
-    }
-
-    fault_retry_count++;
-    printf("FAULT: nFAULT asserted — reset attempt %u of %u\r\n",
-           fault_retry_count, FAULT_MAX_RETRIES);
-
-    /* Pulse nSLEEP low 20–50 µs to reset the DRV8311H fault latch */
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-    HAL_Delay(1);   /* ≥ 20 µs required; 1 ms is safe */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-    HAL_Delay(5);   /* tWAKE settle */
+    HAL_Delay(5U);
 
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_RESET)
-    {
-        printf("FAULT: nFAULT still LOW after reset — halting.\r\n");
-        printf("       Check VM, AVDD, motor winding, OCP threshold.\r\n");
-        Error_Handler();
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_SET) {
+        return 1U;
     }
 
-    printf("FAULT: cleared — motor halted. Power-cycle to restart.\r\n");
-    /* Intentionally do NOT restart the motor automatically.
-     * A human should investigate before re-enabling drive.   */
+    printf("WARNING: nFAULT low at startup, resetting driver\r\n");
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    HAL_Delay(2U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    HAL_Delay(5U);
+
+    return (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_SET) ? 1U : 0U;
 }
 
-/* ===========================================================================
- * TIM1 Update ISR — fires at 40 kHz (center-aligned, RC=0)
- *
- * Kept lean: only increments isr_tick for timing statistics.
- * All commutation logic runs in the main-loop via commutation_tick_handler().
- * =========================================================================*/
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+static void driver_fault_stop(const char *reason)
 {
-    if (htim->Instance != TIM1) return;
-    isr_tick++;
+    motor_state = MOTOR_FAULT;
+    outputs_hiz();
+
+    printf("FAULT: %s\r\n", reason);
+    printf("FAULT: outputs disabled, driver reset required\r\n");
+
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    HAL_Delay(2U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    HAL_Delay(5U);
+
+    Error_Handler();
 }
 
-/* ===========================================================================
- * TIM1_UP_TIM16_IRQHandler
- *
- * !! IMPORTANT !!
- * On STM32G4, TIM1 update and TIM16 share one IRQ vector.
- * DELETE the matching handler in stm32g4xx_it.c to avoid a linker error.
- * =========================================================================*/
-void TIM1_UP_TIM16_IRQHandler(void)
+static float electrical_angle_from_mech(float mech_angle_rad)
 {
-    HAL_TIM_IRQHandler(&htim1);
+    return normalize_angle(zero_electrical_offset_rad
+                           + (ENCODER_DIRECTION * MOTOR_POLE_PAIRS * mech_angle_rad));
 }
 
-/* ===========================================================================
- * main
- * =========================================================================*/
+static void motor_align_and_capture_zero(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    float mean_sin = 0.0f;
+    float mean_cos = 0.0f;
+    uint32_t sample_count = 0U;
+    uint32_t align_duty_ccr = (ALIGN_DUTY_PERCENT * PWM_PERIOD) / 100U;
+
+    motor_state = MOTOR_ALIGNING;
+
+    printf("ALIGN: 2-phase lock, ramp %lu ms, hold %lu ms, duty %u%%\r\n",
+           (unsigned long)ALIGN_RAMP_MS,
+           (unsigned long)ALIGN_HOLD_MS,
+           (unsigned)ALIGN_DUTY_PERCENT);
+
+    while ((HAL_GetTick() - start_ms) < ALIGN_RAMP_MS) {
+        uint32_t elapsed = HAL_GetTick() - start_ms;
+        uint32_t duty = (align_duty_ccr * elapsed) / ALIGN_RAMP_MS;
+        apply_two_phase_align(duty);
+
+        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_RESET) {
+            driver_fault_stop("nFAULT during 2-phase alignment ramp");
+        }
+        HAL_Delay(1U);
+    }
+
+    apply_two_phase_align(align_duty_ccr);
+    HAL_Delay(ALIGN_HOLD_MS);
+
+    for (sample_count = 0U; sample_count < ALIGN_SAMPLE_COUNT; ++sample_count) {
+        EncoderSample_t sample;
+        if (!encoder_sample(&sample)) {
+            driver_fault_stop("AS5600 read failed during alignment capture");
+        }
+        mean_sin += sinf(sample.mech_angle_rad);
+        mean_cos += cosf(sample.mech_angle_rad);
+        HAL_Delay(2U);
+    }
+
+    {
+        float aligned_mech = atan2f(mean_sin, mean_cos);
+        if (aligned_mech < 0.0f) {
+            aligned_mech += TWO_PI_F;
+        }
+
+        zero_electrical_offset_rad = normalize_angle(
+            ALIGN_SECTOR_CENTER_RAD - (ENCODER_DIRECTION * MOTOR_POLE_PAIRS * aligned_mech));
+
+        encoder_reset_tracking(aligned_mech);
+        target_mech_angle_rad = mech_angle_unwrapped_rad;
+
+        encoder_mech_deg_dbg = radians_to_degrees(aligned_mech);
+        target_mech_deg_dbg = radians_to_degrees(target_mech_angle_rad);
+
+        printf("ALIGN: rotor settled\r\n");
+        printf("ENCODER: mech=%.2f deg -> electrical zero=%.2f deg\r\n",
+               (double)radians_to_degrees(aligned_mech),
+               (double)radians_to_degrees(zero_electrical_offset_rad));
+
+        outputs_enable_sine_mode();
+        apply_sine_pwm(ALIGN_SECTOR_CENTER_RAD, RUN_START_MODULATION);
+        HAL_Delay(SINE_HANDOFF_MS);
+    }
+}
+
 int main(void)
 {
+    uint32_t last_control_us;
+    uint32_t last_debug_ms;
+    uint32_t run_start_ms;
+    float speed_estimate_rps = 0.0f;
+    EncoderSample_t sample;
+
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
     MX_I2C1_Init();
     MX_TIM1_Init();
     MX_USART3_UART_Init();
+    dwt_init();
 
-    printf("\r\n=== DRV8311H BLDC 6-Step Open-Loop Drive ===\r\n");
-    printf("MCU   : STM32G431CBT6 @ 170 MHz\r\n");
-    printf("PWM   : %u Hz center-aligned | period = %u counts\r\n",
-           PWM_FREQ_HZ, PWM_PERIOD);
-    printf("Align : %u ms @ %u%% duty\r\n", ALIGN_TIME_MS, START_DUTY_PERCENT);
-    printf("Ramp  : %u → %u ms/step, dec every %u steps by %u ms\r\n",
-           START_COMMUTATION_DELAY_MS, MIN_COMMUTATION_DELAY_MS,
-           COMMUTATION_RAMP_STEP_REVS, COMMUTATION_RAMP_DEC_MS);
+    printf("\r\n=== DRV8311H + AS5600 Sinusoidal 3x PWM ===\r\n");
+    printf("PWM          : %u Hz center aligned\r\n", PWM_FREQ_HZ);
+    printf("Motor        : %.0f pole pairs\r\n", (double)MOTOR_POLE_PAIRS);
+    printf("Run speed    : %.2f rps mech (%.1f rpm)\r\n",
+           (double)TARGET_MECH_SPEED_RPS,
+           (double)(TARGET_MECH_SPEED_RPS * 60.0f));
+    printf("Run mod      : %.0f%% -> %.0f%%\r\n",
+           (double)(RUN_START_MODULATION * 100.0f),
+           (double)(RUN_TARGET_MODULATION * 100.0f));
+    printf("Encoder dir  : %.0f | Rotation dir : %.0f\r\n",
+           (double)ENCODER_DIRECTION,
+           (double)ROTATION_DIRECTION);
 
-    /* -----------------------------------------------------------------------
-     * 1. Wake DRV8311H — drive nSLEEP HIGH and wait for charge pump
-     * --------------------------------------------------------------------- */
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-    HAL_Delay(5);   /* tWAKE ~1 ms; 5 ms gives charge-pump margin */
+    outputs_hiz();
 
-    /* -----------------------------------------------------------------------
-     * 2. Check / clear nFAULT before touching PWM
-     * --------------------------------------------------------------------- */
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_RESET)
-    {
-        printf("WARNING: nFAULT LOW at startup — attempting clear\r\n");
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-        HAL_Delay(1);
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-        HAL_Delay(5);
-
-        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_RESET)
-        {
-            printf("ERROR: nFAULT still LOW. Possible causes:\r\n");
-            printf("  - VM undervoltage (need > 2.7 V)\r\n");
-            printf("  - AVDD cap not charged / missing\r\n");
-            printf("  - nFAULT pullup resistor missing\r\n");
-            printf("  - OCP: short on motor wires or winding fault\r\n");
-            Error_Handler();
-        }
+    if (!driver_wake_and_check_fault()) {
+        printf("ERROR: nFAULT remained low after reset\r\n");
+        Error_Handler();
     }
     printf("nFAULT: OK\r\n");
 
-    /* -----------------------------------------------------------------------
-     * 3. Pre-load 0 duty on all channels (safe: no current until MOE set)
-     * --------------------------------------------------------------------- */
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
-
-    /* All INLx LOW → all phases Hi-Z at startup */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
-
-    /* -----------------------------------------------------------------------
-     * 4. Start PWM output channels
-     * --------------------------------------------------------------------- */
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);   /* PA8  → INHA */
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);   /* PA9  → INHB */
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);   /* PA10 → INHC */
-
-    /* -----------------------------------------------------------------------
-     * 5. Clear pending update flag BEFORE enabling interrupt.
-     *    TIM_EGR_UG written in MX_TIM1_Init sets UIF; clear it now so the
-     *    ISR does not fire spuriously on the very first enable.
-     * --------------------------------------------------------------------- */
-    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
-
-    /* -----------------------------------------------------------------------
-     * 6. Start timer base interrupt (sets UIE and configures NVIC)
-     * --------------------------------------------------------------------- */
-    if (HAL_TIM_Base_Start_IT(&htim1) != HAL_OK)
-    {
-        printf("ERROR: HAL_TIM_Base_Start_IT failed\r\n");
+    magnet_ok_dbg = as5600_magnet_detected();
+    printf("AS5600: magnet=%s\r\n", magnet_ok_dbg ? "OK" : "NO");
+    if (!magnet_ok_dbg) {
+        printf("ERROR: AS5600 magnet not detected\r\n");
         Error_Handler();
     }
 
-    /* -----------------------------------------------------------------------
-     * 7. Assert MOE *after* HAL_TIM_Base_Start_IT (that call can clear MOE)
-     * --------------------------------------------------------------------- */
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, PWM_HALF_PERIOD);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, PWM_HALF_PERIOD);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, PWM_HALF_PERIOD);
+
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK) {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK) {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK) {
+        Error_Handler();
+    }
+
     __HAL_TIM_MOE_ENABLE(&htim1);
-    printf("BDTR = 0x%08lX  (bit15 MOE must = 1)\r\n", TIM1->BDTR);
+    printf("BDTR = 0x%08lX\r\n", (unsigned long)TIM1->BDTR);
 
-    if (!(TIM1->BDTR & TIM_BDTR_MOE))
-    {
-        printf("ERROR: MOE bit not set — check LockLevel in BDTR config\r\n");
-        Error_Handler();
+    HAL_Delay(STARTUP_IDLE_MS);
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_RESET) {
+        driver_fault_stop("nFAULT low before alignment");
     }
 
-    /* -----------------------------------------------------------------------
-     * 8. Dwell at idle (0% duty, Hi-Z phases) for 200 ms — verify no fault
-     * --------------------------------------------------------------------- */
-    printf("Holding idle (Hi-Z) for 200 ms...\r\n");
-    HAL_Delay(200);
+    motor_align_and_capture_zero();
 
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_RESET)
-    {
-        printf("ERROR: nFAULT at idle — hardware fault. Halting.\r\n");
-        Error_Handler();
+    if (!encoder_sample(&sample)) {
+        driver_fault_stop("AS5600 read failed after alignment");
     }
 
-    /* -----------------------------------------------------------------------
-     * 9. Initialise duty and alignment step — lock rotor to step 0
-     * --------------------------------------------------------------------- */
-    duty_ccr = DUTY_TO_CCR(START_DUTY_PERCENT);  /* must be set before align */
-    motor_align();
+    encoder_raw_dbg = sample.raw;
+    encoder_mech_deg_dbg = sample.mech_angle_deg;
+    encoder_mech_unwrapped_dbg = radians_to_degrees(sample.mech_unwrapped_rad);
+    magnet_ok_dbg = sample.magnet_ok;
+    rotor_elec_deg_dbg = radians_to_degrees(electrical_angle_from_mech(sample.mech_unwrapped_rad));
 
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_RESET)
-    {
-        printf("ERROR: nFAULT during alignment — OCP? Reduce START_DUTY_PERCENT.\r\n");
-        Error_Handler();
-    }
+    run_start_ms = HAL_GetTick();
+    last_control_us = micros32();
+    last_debug_ms = run_start_ms;
+    target_mech_angle_rad = sample.mech_unwrapped_rad;
+    motor_state = MOTOR_RUNNING;
 
-    /* -----------------------------------------------------------------------
-     * 10. Begin open-loop commutation ramp
-     * --------------------------------------------------------------------- */
-    commutation_delay_ms = START_COMMUTATION_DELAY_MS;
-    last_comm_tick       = HAL_GetTick();
-    motor_state          = MOTOR_RAMPING;
-    printf("COMM: starting ramp — %u ms/step → %u ms/step\r\n",
-           START_COMMUTATION_DELAY_MS, MIN_COMMUTATION_DELAY_MS);
+    printf("RUN: sinusoidal encoder voltage mode active\r\n");
 
-    /* -----------------------------------------------------------------------
-     * TODO: ADC / OCP hook
-     *   Insert HAL_ADC_Start_DMA() here once ADC channels are configured for
-     *   SOA/SOB/SOC.  Sample in the TIM1 ISR or a DMA complete callback and
-     *   compare against an overcurrent threshold derived from:
-     *     I_trip (A) = (adc_raw / 4095.0f * 3.3f) / (CSA_GAIN * SHUNT_OHMS)
-     *   Call emergency_stop() if I_trip is exceeded.
-     * --------------------------------------------------------------------- */
+    while (1) {
+        uint32_t now_us = micros32();
+        uint32_t dt_us = now_us - last_control_us;
 
-    /* =====================================================================
-     * Main loop — commutation tick + fault monitoring + debug print
-     * =================================================================== */
-    uint32_t last_print  = 0;
-    uint8_t  prev_nfault = GPIO_PIN_SET;
-
-    while (1)
-    {
-        /* ----- Commutation advance ---------------------------------------- */
-        commutation_tick_handler();
-
-        /* ----- nFAULT monitoring (edge-triggered) ------------------------- */
-        uint8_t nfault = (uint8_t)HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14);
-
-        if (nfault != prev_nfault)
-        {
-            if (nfault == GPIO_PIN_RESET)
-            {
-                printf("!!! nFAULT ASSERTED\r\n");
-                handle_fault();   /* halts or stops motor; see function above */
-            }
-            else
-            {
-                printf("nFAULT: de-asserted (cleared externally)\r\n");
-            }
-            prev_nfault = nfault;
+        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) == GPIO_PIN_RESET) {
+            driver_fault_stop("nFAULT asserted during run");
         }
 
-        /* ----- Debug print every 500 ms ----------------------------------- */
-        if (HAL_GetTick() - last_print >= 500U)
+        if (dt_us < CONTROL_PERIOD_US) {
+            continue;
+        }
+        last_control_us = now_us;
+
+        if (!encoder_sample(&sample)) {
+            i2c_fault_dbg = 1U;
+            continue;
+        }
+        i2c_fault_dbg = 0U;
+
         {
-            const char *state_str;
-            switch (motor_state)
-            {
-                case MOTOR_IDLE:      state_str = "IDLE";      break;
-                case MOTOR_ALIGNING:  state_str = "ALIGNING";  break;
-                case MOTOR_RAMPING:   state_str = "RAMPING";   break;
-                case MOTOR_RUNNING:   state_str = "RUNNING";   break;
-                case MOTOR_FAULT:     state_str = "FAULT";     break;
-                default:              state_str = "UNKNOWN";   break;
-            }
+            float dt = (float)dt_us * 1.0e-6f;
+            float elapsed_ms = (float)(HAL_GetTick() - run_start_ms);
+            float settle_ramp = clampf(elapsed_ms / (float)RUN_SETTLE_MS, 0.0f, 1.0f);
+            float speed_ramp = clampf(elapsed_ms / (float)SPEED_RAMP_MS, 0.0f, 1.0f);
+            float mod_ramp = clampf(elapsed_ms / (float)MODULATION_RAMP_MS, 0.0f, 1.0f);
+            float speed_cmd = TARGET_MECH_SPEED_RPS * speed_ramp;
+            float modulation = RUN_START_MODULATION
+                             + (RUN_TARGET_MODULATION - RUN_START_MODULATION) * mod_ramp;
+            float previous_mech = encoder_mech_unwrapped_dbg * (PI_F / 180.0f);
+            float delta_mech = sample.mech_unwrapped_rad - previous_mech;
+            float mech_error;
+            float elec_error;
+            float rotor_elec;
+            float lead_rad;
+            float control_theta;
+            float stator_theta;
 
-            printf("t=%lums | state=%s | step=%u | delay=%lums | isr_tick=%lu | nFAULT=%s\r\n",
-                   HAL_GetTick(),
-                   state_str,
-                   (unsigned)comm_step,
-                   commutation_delay_ms,
-                   isr_tick,
-                   nfault ? "OK" : "FAULT!");
+            speed_estimate_rps = 0.90f * speed_estimate_rps
+                               + 0.10f * (delta_mech / (TWO_PI_F * dt));
 
-            last_print = HAL_GetTick();
+            target_mech_angle_rad += ROTATION_DIRECTION * speed_cmd * TWO_PI_F * dt;
+            mech_error = target_mech_angle_rad - sample.mech_unwrapped_rad;
+            elec_error = wrap_pm_pi(MOTOR_POLE_PAIRS * mech_error);
+
+            lead_rad = clampf(POSITION_KP * elec_error
+                            + (ROTATION_DIRECTION * FEEDFORWARD_LEAD_RAD * speed_ramp),
+                              -MAX_TORQUE_LEAD_RAD,
+                               MAX_TORQUE_LEAD_RAD);
+
+            rotor_elec = electrical_angle_from_mech(sample.mech_unwrapped_rad);
+            control_theta = normalize_angle(rotor_elec + lead_rad);
+            stator_theta = lerp_angle(ALIGN_SECTOR_CENTER_RAD, control_theta, settle_ramp);
+
+            outputs_enable_sine_mode();
+            apply_sine_pwm(stator_theta, modulation);
+
+            encoder_raw_dbg = sample.raw;
+            encoder_mech_deg_dbg = sample.mech_angle_deg;
+            encoder_mech_unwrapped_dbg = radians_to_degrees(sample.mech_unwrapped_rad);
+            rotor_elec_deg_dbg = radians_to_degrees(rotor_elec);
+            stator_elec_deg_dbg = radians_to_degrees(stator_theta);
+            target_mech_deg_dbg = radians_to_degrees(target_mech_angle_rad);
+            lead_deg_dbg = radians_to_degrees(lead_rad);
+            speed_rpm_dbg = speed_estimate_rps * 60.0f;
+            modulation_dbg = modulation * 100.0f;
+            magnet_ok_dbg = sample.magnet_ok;
         }
 
-        /* ----- TODO: BEMF zero-crossing detection hook -------------------- */
-        /* Sample the floating phase ADC here (or in a comparator ISR) to
-         * detect zero-crossings for sensorless closed-loop commutation.
-         * When a zero-crossing is detected update last_comm_tick and call
-         * apply_commutation_step() directly instead of waiting for the timer.
-         */
+        if ((HAL_GetTick() - last_debug_ms) >= DEBUG_PERIOD_MS) {
+            printf("t=%lums | mech=%.2f deg | mech_pos=%.2f deg | target=%.2f deg | rotor_e=%.2f deg | stator_e=%.2f deg | lead=%.2f deg | mod=%.1f%% | speed=%.2f rpm | raw=%u | magnet=%s | i2c=%s\r\n",
+                   (unsigned long)HAL_GetTick(),
+                   (double)encoder_mech_deg_dbg,
+                   (double)encoder_mech_unwrapped_dbg,
+                   (double)target_mech_deg_dbg,
+                   (double)rotor_elec_deg_dbg,
+                   (double)stator_elec_deg_dbg,
+                   (double)lead_deg_dbg,
+                   (double)modulation_dbg,
+                   (double)speed_rpm_dbg,
+                   (unsigned)encoder_raw_dbg,
+                   magnet_ok_dbg ? "OK" : "NO",
+                   i2c_fault_dbg ? "ERR" : "OK");
+            last_debug_ms = HAL_GetTick();
+        }
     }
 }
 
-/* ===========================================================================
- * MX_TIM1_Init — center-aligned PWM @ 20 kHz switching, 40 kHz UEV/ISR
- *
- * RepetitionCounter = 0:  UEV fires every counter overflow (top + bottom).
- * The PWM outputs are enabled only after main() calls HAL_TIM_PWM_Start().
- * MOE is set after HAL_TIM_Base_Start_IT() to prevent it being overwritten.
- * =========================================================================*/
 static void MX_TIM1_Init(void)
 {
     TIM_ClockConfigTypeDef         sClockSourceConfig = {0};
-    TIM_MasterConfigTypeDef        sMasterConfig      = {0};
-    TIM_OC_InitTypeDef             sConfigOC          = {0};
-    TIM_BreakDeadTimeConfigTypeDef sBDT               = {0};
+    TIM_MasterConfigTypeDef        sMasterConfig = {0};
+    TIM_OC_InitTypeDef             sConfigOC = {0};
+    TIM_BreakDeadTimeConfigTypeDef sBDT = {0};
 
-    htim1.Instance               = TIM1;
-    htim1.Init.Prescaler         = 0;
-    htim1.Init.CounterMode       = TIM_COUNTERMODE_CENTERALIGNED1;
-    htim1.Init.Period            = PWM_PERIOD;
-    htim1.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim1.Init.RepetitionCounter = 0;   /* KEY: UEV every overflow, not every 2nd */
+    htim1.Instance = TIM1;
+    htim1.Init.Prescaler = 0U;
+    htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
+    htim1.Init.Period = PWM_PERIOD;
+    htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim1.Init.RepetitionCounter = 0U;
     htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-    if (HAL_TIM_Base_Init(&htim1) != HAL_OK) Error_Handler();
+    if (HAL_TIM_Base_Init(&htim1) != HAL_OK) {
+        Error_Handler();
+    }
 
     sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-    if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+    if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK) {
         Error_Handler();
+    }
 
-    if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) {
+        Error_Handler();
+    }
 
-    sMasterConfig.MasterOutputTrigger  = TIM_TRGO_RESET;
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
     sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
-    sMasterConfig.MasterSlaveMode      = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) {
         Error_Handler();
+    }
 
-    sConfigOC.OCMode       = TIM_OCMODE_PWM1;
-    sConfigOC.Pulse        = 0;            /* start at 0 duty — phases Hi-Z    */
-    sConfigOC.OCPolarity   = TIM_OCPOLARITY_HIGH;
-    sConfigOC.OCNPolarity  = TIM_OCNPOLARITY_HIGH;
-    sConfigOC.OCFastMode   = TIM_OCFAST_DISABLE;
-    sConfigOC.OCIdleState  = TIM_OCIDLESTATE_RESET;
+    sConfigOC.OCMode = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse = PWM_HALF_PERIOD;
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+    sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
     sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-        Error_Handler();
-    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-        Error_Handler();
-    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-        Error_Handler();
 
-    /* CCR preload — new values latch at UEV, preventing mid-cycle glitches */
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK) {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK) {
+        Error_Handler();
+    }
+
     TIM1->CCMR1 |= (TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE);
-    TIM1->CCMR2 |=  TIM_CCMR2_OC3PE;
-    TIM1->EGR    =  TIM_EGR_UG;   /* latch preload regs — also sets UIF       */
-    /* UIF cleared in main() just before HAL_TIM_Base_Start_IT()              */
+    TIM1->CCMR2 |= TIM_CCMR2_OC3PE;
+    TIM1->EGR = TIM_EGR_UG;
 
-    sBDT.OffStateRunMode  = TIM_OSSR_ENABLE;
-    sBDT.OffStateIDLEMode = TIM_OSSI_DISABLE;   /* Hi-Z when idle — safe       */
-    sBDT.LockLevel        = TIM_LOCKLEVEL_OFF;
-    sBDT.DeadTime         = DEAD_TIME_COUNTS;
-    sBDT.BreakState       = TIM_BREAK_DISABLE;
-    sBDT.BreakPolarity    = TIM_BREAKPOLARITY_HIGH;
-    sBDT.BreakFilter      = 0;
-    sBDT.BreakAFMode      = TIM_BREAK_AFMODE_INPUT;
-    sBDT.Break2State      = TIM_BREAK2_DISABLE;
-    sBDT.Break2Polarity   = TIM_BREAK2POLARITY_HIGH;
-    sBDT.Break2Filter     = 0;
-    sBDT.Break2AFMode     = TIM_BREAK_AFMODE_INPUT;
-    sBDT.AutomaticOutput  = TIM_AUTOMATICOUTPUT_ENABLE;
-    if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBDT) != HAL_OK)
+    sBDT.OffStateRunMode = TIM_OSSR_ENABLE;
+    sBDT.OffStateIDLEMode = TIM_OSSI_DISABLE;
+    sBDT.LockLevel = TIM_LOCKLEVEL_OFF;
+    sBDT.DeadTime = DEAD_TIME_COUNTS;
+    sBDT.BreakState = TIM_BREAK_DISABLE;
+    sBDT.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+    sBDT.BreakFilter = 0U;
+    sBDT.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
+    sBDT.Break2State = TIM_BREAK2_DISABLE;
+    sBDT.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+    sBDT.Break2Filter = 0U;
+    sBDT.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
+    sBDT.AutomaticOutput = TIM_AUTOMATICOUTPUT_ENABLE;
+    if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBDT) != HAL_OK) {
         Error_Handler();
-
-    /* Explicitly enable TIM1 update interrupt in NVIC.
-     * HAL_TIM_Base_Start_IT() also does this; being explicit documents intent.
-     * Priority 0 = highest — keep the ISR lean if changing priority.        */
-    HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
+    }
 
     HAL_TIM_MspPostInit(&htim1);
 }
 
-/* ===========================================================================
- * SystemClock_Config — 170 MHz via HSI + PLL
- * =========================================================================*/
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -741,31 +653,31 @@ void SystemClock_Config(void)
 
     HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
-    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
-    RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
     RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
-    RCC_OscInitStruct.PLL.PLLM            = RCC_PLLM_DIV4;
-    RCC_OscInitStruct.PLL.PLLN            = 85;
-    RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV2;
-    RCC_OscInitStruct.PLL.PLLQ            = RCC_PLLQ_DIV2;
-    RCC_OscInitStruct.PLL.PLLR            = RCC_PLLR_DIV2;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+    RCC_OscInitStruct.PLL.PLLN = 85;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+    RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        Error_Handler();
+    }
 
-    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-                                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
     RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
         Error_Handler();
+    }
 }
 
-/* ===========================================================================
- * MX_GPIO_Init
- * =========================================================================*/
 static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -774,90 +686,88 @@ static void MX_GPIO_Init(void)
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
-    /* PC13 = nSLEEP — start LOW (DRV asleep) until main() wakes it */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-    GPIO_InitStruct.Pin   = GPIO_PIN_13;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* PC14 = nFAULT — input with internal pullup */
-    GPIO_InitStruct.Pin  = GPIO_PIN_14;
+    GPIO_InitStruct.Pin = GPIO_PIN_14;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* PB13/14/15 = INLA/B/C — GPIO output, start LOW (all phases Hi-Z).
-     * Written LOW before HAL_GPIO_Init to guarantee no transient HIGH.
-     * apply_commutation_step() will drive them HIGH/LOW per step.           */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+    HAL_GPIO_WritePin(GPIOB,
+                      GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
                       GPIO_PIN_RESET);
-    GPIO_InitStruct.Pin   = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
-/* ===========================================================================
- * MX_I2C1_Init
- * =========================================================================*/
 static void MX_I2C1_Init(void)
 {
-    hi2c1.Instance             = I2C1;
-    hi2c1.Init.Timing          = 0x40B285C2;
-    hi2c1.Init.OwnAddress1     = 0;
-    hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.Timing = 0x40B285C2;
+    hi2c1.Init.OwnAddress1 = 0U;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
     hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-    hi2c1.Init.OwnAddress2     = 0;
-    hi2c1.Init.OwnAddress2Masks= I2C_OA2_NOMASK;
+    hi2c1.Init.OwnAddress2 = 0U;
+    hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
     hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-    hi2c1.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
-    if (HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
-    if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
         Error_Handler();
-    if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK) Error_Handler();
+    }
+    if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK) {
+        Error_Handler();
+    }
+    if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0U) != HAL_OK) {
+        Error_Handler();
+    }
 }
 
-/* ===========================================================================
- * MX_USART3_UART_Init — 115200 8N1
- * =========================================================================*/
 static void MX_USART3_UART_Init(void)
 {
-    huart3.Instance            = USART3;
-    huart3.Init.BaudRate       = 115200;
-    huart3.Init.WordLength     = UART_WORDLENGTH_8B;
-    huart3.Init.StopBits       = UART_STOPBITS_1;
-    huart3.Init.Parity         = UART_PARITY_NONE;
-    huart3.Init.Mode           = UART_MODE_TX_RX;
-    huart3.Init.HwFlowCtl      = UART_HWCONTROL_NONE;
-    huart3.Init.OverSampling   = UART_OVERSAMPLING_16;
+    huart3.Instance = USART3;
+    huart3.Init.BaudRate = 115200;
+    huart3.Init.WordLength = UART_WORDLENGTH_8B;
+    huart3.Init.StopBits = UART_STOPBITS_1;
+    huart3.Init.Parity = UART_PARITY_NONE;
+    huart3.Init.Mode = UART_MODE_TX_RX;
+    huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
     huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
     huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
     huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-    if (HAL_UART_Init(&huart3) != HAL_OK) Error_Handler();
-    if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+    if (HAL_UART_Init(&huart3) != HAL_OK) {
         Error_Handler();
-    if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+    }
+    if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK) {
         Error_Handler();
-    if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK) Error_Handler();
+    }
+    if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK) {
+        Error_Handler();
+    }
+    if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK) {
+        Error_Handler();
+    }
 }
 
-/* ===========================================================================
- * Error_Handler — make all phases Hi-Z then halt
- * =========================================================================*/
 void Error_Handler(void)
 {
     __disable_irq();
 
-    /* Drive INHx to 0 and INLx to 0 → all phases Hi-Z */
-    TIM1->CCR1 = 0;
-    TIM1->CCR2 = 0;
-    TIM1->CCR3 = 0;
-    GPIOB->BSRR = (GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15) << 16U; /* reset */
+    TIM1->CCR1 = 0U;
+    TIM1->CCR2 = 0U;
+    TIM1->CCR3 = 0U;
+    GPIOB->BSRR = (uint32_t)(GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15) << 16U;
 
-    while (1) {}
+    while (1) {
+    }
 }
 
 #ifdef USE_FULL_ASSERT

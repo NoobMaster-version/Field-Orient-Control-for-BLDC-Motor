@@ -1,0 +1,174 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+#include <st/g4/stm32g431Xb.dtsi>
+#include <st/g4/stm32g431c(6-8-b)tx-pinctrl.dtsi>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pwm/pwm.h>
+
+/ {
+	model = "Field Orient STM32G431 Custom Board";
+	compatible = "others,field-orient-g431";
+
+	chosen {
+		zephyr,console = &usart3;
+		zephyr,shell-uart = &usart3;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+	};
+
+	aliases {
+		as5600 = &as5600;
+		phase-pwm-a = &phase_pwm_a;
+		phase-pwm-b = &phase_pwm_b;
+		phase-pwm-c = &phase_pwm_c;
+		current-sense-a = &current_sense_a;
+		current-sense-b = &current_sense_b;
+		current-sense-c = &current_sense_c;
+		watchdog0 = &iwdg;
+	};
+
+	zephyr,user {
+		drv_nsleep_gpios = <&gpioc 13 GPIO_ACTIVE_HIGH>;
+		drv_nfault_gpios = <&gpioc 14 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		drv_inla_gpios = <&gpiob 13 GPIO_ACTIVE_HIGH>;
+		drv_inlb_gpios = <&gpiob 14 GPIO_ACTIVE_HIGH>;
+		drv_inlc_gpios = <&gpiob 15 GPIO_ACTIVE_HIGH>;
+	};
+
+	phase_pwms {
+		compatible = "pwm-leds";
+
+		phase_pwm_a: phase-pwm-a {
+			pwms = <&pwm1 1 PWM_USEC(50) PWM_POLARITY_NORMAL>;
+		};
+
+		phase_pwm_b: phase-pwm-b {
+			pwms = <&pwm1 2 PWM_USEC(50) PWM_POLARITY_NORMAL>;
+		};
+
+		phase_pwm_c: phase-pwm-c {
+			pwms = <&pwm1 3 PWM_USEC(50) PWM_POLARITY_NORMAL>;
+		};
+	};
+
+	current_sense_a: current-sense-a {
+		io-channels = <&adc1 1>;
+	};
+
+	current_sense_b: current-sense-b {
+		io-channels = <&adc2 2>;
+	};
+
+	current_sense_c: current-sense-c {
+		io-channels = <&adc1 3>;
+	};
+};
+
+&clk_hsi {
+	status = "okay";
+};
+
+&clk_lsi {
+	status = "okay";
+};
+
+&clk_hse {
+	status = "disabled";
+};
+
+&pll {
+	div-m = <4>;
+	mul-n = <85>;
+	div-p = <7>;
+	div-q = <2>;
+	div-r = <2>;
+	clocks = <&clk_hsi>;
+	status = "okay";
+};
+
+&rcc {
+	clocks = <&pll>;
+	clock-frequency = <DT_FREQ_M(170)>;
+	ahb-prescaler = <1>;
+	apb1-prescaler = <1>;
+	apb2-prescaler = <1>;
+};
+
+stm32_lp_tick_source: &lptim1 {
+	clocks = <&rcc STM32_CLOCK_BUS_APB1 0x80000000>,
+		 <&rcc STM32_SRC_LSI LPTIM1_SEL(1)>;
+	status = "okay";
+};
+
+&rtc {
+	clocks = <&rcc STM32_CLOCK_BUS_APB1 0x00000400>,
+		 <&rcc STM32_SRC_LSI RTC_SEL(2)>;
+	status = "okay";
+};
+
+&usart3 {
+	pinctrl-0 = <&usart3_tx_pb10 &usart3_rx_pb11>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+
+&i2c1 {
+	pinctrl-0 = <&i2c1_scl_pa15 &i2c1_sda_pb7>;
+	pinctrl-names = "default";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	status = "okay";
+
+	as5600: as5600@36 {
+		compatible = "ams,as5600";
+		reg = <0x36>;
+		status = "okay";
+	};
+};
+
+&timers1 {
+	st,prescaler = <0>;
+	status = "okay";
+
+	pwm1: pwm {
+		status = "okay";
+		pinctrl-0 = <&tim1_ch1_pa8 &tim1_ch2_pa9 &tim1_ch3_pa10>;
+		pinctrl-names = "default";
+	};
+};
+
+&adc1 {
+	pinctrl-0 = <&adc1_in1_pa0 &adc1_in3_pa2>;
+	pinctrl-names = "default";
+	st,adc-clock-source = "SYNC";
+	st,adc-prescaler = <4>;
+	status = "okay";
+};
+
+&adc2 {
+	pinctrl-0 = <&adc2_in2_pa1>;
+	pinctrl-names = "default";
+	st,adc-clock-source = "SYNC";
+	st,adc-prescaler = <4>;
+	status = "okay";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@1f000 {
+			label = "storage";
+			reg = <0x0001f000 0x1000>;
+		};
+	};
+};
+
+&iwdg {
+	status = "okay";
+};
